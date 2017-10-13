@@ -25,23 +25,49 @@ def __conv(net, kernel_size, stride, num_outputs, scope = 'conv'):
                   scope = scope
                   )
     return net
+
+@slim.add_arg_scope
+def __scale(inputs, beta_initializer, gamma_initializer, is_training, scope = None):
+    if scope is not None:
+        scope = '%s_scale'%(scope)
+    else:
+        scope = 'scale'
+    with tf.variable_scope(scope):
+        dtype = inputs.dtype.base_dtype
+        input_shape = inputs.get_shape()
+        param_shape = input_shape[-1:]
+        beta = tf.get_variable(name = 'beta', 
+                               shape = param_shape,
+                               dtype = dtype, 
+                               initializer = beta_initializer, 
+                               trainable = is_training
+                               )
+        gamma = tf.get_variable(name = 'gamma', 
+                       shape = param_shape,
+                       dtype = dtype, 
+                       initializer = gamma_initializer, 
+                       trainable = is_training
+                       )
+        
+        return inputs * gamma + beta
     
-def __conv_bn(net, kernel_size, stride, num_outputs):
-    net = __conv(net, kernel_size, stride, num_outputs)
-    net = slim.batch_norm(net, scope = 'bn')
-    return net
+def __bn_relu_conv(net, kernel_size, stride,num_outputs, scope = ''):
+    with tf.variable_scope(scope):
+        net = slim.batch_norm(net, scope = 'bn')
+        net = __scale(net)
+        net = tf.nn.relu(net, name = 'relu')
+        net = __conv(net, kernel_size, stride, num_outputs)
+        return net
     
 def __conv_bn_relu(net, kernel_size, stride,num_outputs, scope = ''):
     with tf.variable_scope(scope):
-        net = __conv_bn(net, kernel_size, stride, num_outputs)
+        net = __conv(net, kernel_size, stride, num_outputs)
+        net = slim.batch_norm(net, scope = 'bn')
+        net = __scale(net)
         net = tf.nn.relu(net, name = 'relu')
         return net
-    
-    
-def __conv_bn_crelu(net, kernel_size, stride, num_outputs, scope = ''):
-    with tf.variable_scope(scope):
-        net = __conv_bn(net, kernel_size, stride, num_outputs)
-        
+def __bn_crelu(net):
+        net = slim.batch_norm(net, scope = 'bn')
         # negation of bn results
         with tf.name_scope('neg'):
             neg_net = -net
@@ -49,10 +75,21 @@ def __conv_bn_crelu(net, kernel_size, stride, num_outputs, scope = ''):
         # concat bn and neg-bn
         with tf.name_scope('concat'):
             net = tf.concat([net, neg_net], axis = -1)
-        
+        net = __scale(net)
         # relu
         net = tf.nn.relu(net, name = 'relu')
         return net
+    
+
+def __conv_bn_crelu(net, kernel_size, stride, num_outputs, scope = ''):
+    with tf.variable_scope(scope):
+        net = __conv(net, kernel_size, stride, num_outputs)
+        return __bn_crelu(net)
+    
+def __bn_crelu_conv(net, kernel_size, stride, num_outputs, scope = ''):
+    with tf.variable_scope(scope):
+        net = __bn_crelu(net)
+        return __conv(net, kernel_size, stride, num_outputs)
     
 def __mCReLU(inputs, mc_config):
     """
@@ -61,25 +98,30 @@ def __mCReLU(inputs, mc_config):
     if the inputs has a different number of channels as crelu output,
     an extra 1x1 conv is added before sum.
     """
+#     print tf.get_variable_scope().name
+#     import pdb
+#     pdb.set_trace()
+
     if mc_config.preact_bn:
-        preact = slim.batch_norm(inputs, scope = 'bn')
-        preact = tf.nn.relu(preact, name = 'relu')
+        conv1_fn = __bn_relu_conv
+        conv1_scope = '1'
     else:
-        preact = inputs
-        
-    sub_conv1 = __conv_bn_relu(preact, 
+        conv1_fn = __conv
+        conv1_scope = '1/conv'
+    
+    sub_conv1 = conv1_fn(inputs, 
                             kernel_size = 1, 
                             stride = mc_config.stride, 
                             num_outputs = mc_config.num_outputs[0], 
-                            scope = '1')
+                            scope = conv1_scope)
     
-    sub_conv2 = __conv_bn_crelu(sub_conv1, 
+    sub_conv2 = __bn_relu_conv(sub_conv1, 
                             kernel_size = 3, 
                             stride = 1, 
                             num_outputs = mc_config.num_outputs[1], 
                             scope = '2')
 
-    sub_conv3 = __conv_bn_relu(sub_conv2, 
+    sub_conv3 = __bn_crelu_conv(sub_conv2, 
                            kernel_size = 1, 
                            stride = 1, 
                            num_outputs = mc_config.num_outputs[2], 
@@ -100,8 +142,6 @@ def __mCReLU(inputs, mc_config):
 
 
 
-
-
 def __inception_block(inputs, block_config):
     num_outputs = block_config.num_outputs.split() # e.g. 64 24-48-48 128
     stride = block_config.stride
@@ -110,7 +150,7 @@ def __inception_block(inputs, block_config):
     num_outputs = num_outputs[:-1]
     pool_path_outputs = None
     if stride > 1:
-        pool_path_outputs = num_outputs[-1]
+        pool_path_outputs = num_outputs[-1][0]
         num_outputs = num_outputs[:-1]
     
     scopes = [['0']] # follow the name style of caffe pva
@@ -126,9 +166,9 @@ def __inception_block(inputs, block_config):
         kernel_sizes.append(path_kernel_sizes)
 
     paths = []
-    
     if block_config.preact_bn:
         preact = slim.batch_norm(inputs, scope = 'bn')
+        preact = __scale(preact)
         preact = tf.nn.relu(preact, name = 'relu')
     else:
         preact = inputs
@@ -146,21 +186,21 @@ def __inception_block(inputs, block_config):
                                       conv_stride, num_output, scope)
         paths.append(path_net)    
     
-    if stride > 2:
+    if stride > 1:
         path_net = slim.pool(inputs, kernel_size = 3, padding='SAME',
-                             stride = 2, name = 'pool')
+                             stride = 2, scope = 'pool')
         path_net = __conv_bn_relu(path_net, 
                                   kernel_size = 1, 
                                   stride = 1, 
                                   num_outputs = pool_path_outputs, 
                                   scope = 'poolproj')
-    paths.append(path_net)
+        paths.append(path_net)
     block_net = tf.concat(paths, axis = -1)
     block_net = __conv(block_net, 
                        kernel_size = 1, 
                        stride =1, 
                        num_outputs = inception_outputs, 
-                       scope = 'out')
+                       scope = 'out/conv')
     
     if inputs.shape.as_list()[-1] == inception_outputs:
         proj = inputs
@@ -191,22 +231,32 @@ def __conv_stage(inputs, block_configs, scope, end_points):
         
 def pvanet_scope(is_training, 
                  weights_initializer = slim.xavier_initializer(), 
-                 batch_norm_param_initializer = None):
+                 batch_norm_param_initializer = None,
+                 beta_initializer = tf.zeros_initializer(), 
+                 gamma_initializer = tf.ones_initializer(),
+                 weight_decay = 0.99):
+    l2_regularizer = slim.l2_regularizer(weight_decay)
     with slim.arg_scope([slim.conv2d], 
                         padding = 'SAME',
-                        weights_initializer =
+                        weights_initializer = weights_initializer,
+                        weights_regularizer = l2_regularizer
                         ):
         with slim.arg_scope([slim.batch_norm], 
                             is_training = is_training,
-                            scale = True, 
-                            center = True, # add bias
+                            scale = False, 
+                            center = False,
                             param_initializers = batch_norm_param_initializer
                             ):
-            with slim.arg_scope([slim.pool], 
-                                pooling_type = 'MAX') as sc:
-                return sc
+            with slim.arg_scope([__scale], 
+                                is_training = is_training, 
+                                beta_initializer = beta_initializer, 
+                                gamma_initializer = gamma_initializer):
+                with slim.arg_scope([slim.pool], 
+                                    pooling_type = 'MAX', 
+                                    padding='SAME') as sc:
+                    return sc
                 
-def pvanet(net):
+def pvanet(net, include_last_bn_relu = True):
     end_points = {}
     
     # conv stage 1
@@ -215,10 +265,9 @@ def pvanet(net):
                                 kernel_size = (7, 7), 
                                 stride = 2, 
                                 num_outputs = 16, 
-                                scope = 'conv1')
+                                scope = 'conv1_1')
     # /2
-    pool1 = slim.pool(conv1_1, kernel_size = 3, padding='VALID',
-                      stride = 2, scope = 'pool1')
+    pool1 = slim.pool(conv1_1, kernel_size = 3, stride = 2, scope = 'pool1')
     
     
     conv2 = __conv_stage(pool1, 
@@ -241,10 +290,10 @@ def pvanet(net):
     
     conv4 = __conv_stage(conv3, 
         block_configs = [
-            BlockConfig(2, '64 48-128 28-48-48 128 256', True, BLOCK_TYPE_INCEP),
-            BlockConfig(1, '64 48-128 28-48-48 256', True, BLOCK_TYPE_INCEP),
-            BlockConfig(1, '64 48-128 28-48-48 256', True, BLOCK_TYPE_INCEP),
-            BlockConfig(1, '64 48-128 28-48-48 256', True, BLOCK_TYPE_INCEP)],
+            BlockConfig(2, '64 48-128 24-48-48 128 256', True, BLOCK_TYPE_INCEP),
+            BlockConfig(1, '64 64-128 24-48-48 256', True, BLOCK_TYPE_INCEP),
+            BlockConfig(1, '64 64-128 24-48-48 256', True, BLOCK_TYPE_INCEP),
+            BlockConfig(1, '64 64-128 24-48-48 256', True, BLOCK_TYPE_INCEP)],
         scope = 'conv4',
         end_points = end_points)
     
@@ -257,5 +306,11 @@ def pvanet(net):
         scope = 'conv5',
         end_points = end_points)
     
+    if include_last_bn_relu:
+        with tf.variable_scope('conv5_4'):
+            last_bn = slim.batch_norm(conv5, scope = 'last_bn')
+            last_bn = __scale(last_bn, scope = 'last_bn')
+            conv5 = tf.nn.relu(last_bn)
+    end_points['conv5'] = conv5 
     return conv5, end_points
 
